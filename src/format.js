@@ -1,6 +1,18 @@
 import chalk from 'chalk'
 import prettyBytes from 'pretty-bytes'
-import { markdownTable } from 'markdown-table'
+import { table as formatTable } from 'table'
+
+const MAX_COLLECTIONS_TO_SHOW = 100 // avoid overwhelming the console if there are lots of leaking collections
+
+function formatStacktraces (stacktraces) {
+  if (!stacktraces || !stacktraces.length) {
+    return ''
+  }
+  // just show a preview of the stacktraces, the first one is good enough
+  const [stacktrace] = stacktraces
+  const { original, pretty } = stacktrace
+  return pretty || original || ''
+}
 
 function formatLeakingObjects (objects) {
   const tableData = [[
@@ -19,7 +31,7 @@ function formatLeakingObjects (objects) {
   return `
 Leaking objects:
 
-${markdownTable(tableData)}
+${formatTable(tableData)}
       `.trim() + '\n\n'
 }
 
@@ -48,7 +60,7 @@ function formatLeakingEventListeners (listenerSummaries, eventListenersSummary) 
   return `
 Leaking event listeners (+${eventListenersSummary.deltaPerIteration} total):
 
-${markdownTable(tableData)}
+${formatTable(tableData)}
       `.trim() + '\n\n'
 }
 
@@ -72,28 +84,30 @@ function formatLeakingDomNodes (domNodes) {
   return `
 Leaking DOM nodes (+${domNodes.deltaPerIteration} total):
 
-${markdownTable(tableData)}
+${formatTable(tableData)}
       `.trim() + '\n\n'
 }
 
 function formatLeakingCollections (leakingCollections) {
   const tableData = [[
-    'Collection type',
-    'Size increase',
-    'Preview'
+    'Type',
+    'Change',
+    'Preview',
+    'Size increased at'
   ]]
 
-  for (const { type, deltaPerIteration, preview } of leakingCollections) {
+  for (const { type, deltaPerIteration, preview, stacktraces } of leakingCollections) {
     tableData.push([
       type,
-      deltaPerIteration,
-      preview
+      `+${deltaPerIteration}`,
+      preview,
+      formatStacktraces(stacktraces)
     ])
   }
   return `
 Leaking collections:
 
-${markdownTable(tableData)}
+${formatTable(tableData)}
       `.trim() + '\n\n'
 }
 
@@ -118,7 +132,10 @@ export function formatResult ({ test, result }) {
     leakTables += formatLeakingDomNodes(result.leaks.domNodes)
   }
   if (result.leaks.collections.length) {
-    leakTables += formatLeakingCollections(result.leaks.collections)
+    leakTables += formatLeakingCollections(result.leaks.collections.slice(0, MAX_COLLECTIONS_TO_SHOW))
+    if (result.leaks.collections.length > MAX_COLLECTIONS_TO_SHOW) {
+      leakTables += `\n(Truncated to ${MAX_COLLECTIONS_TO_SHOW} leaking collections; ${result.leaks.collections.length} leaking collections total.)`
+    }
   }
 
   let snapshots = ''

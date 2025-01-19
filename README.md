@@ -22,7 +22,7 @@ By default, `fuite` will assume that the site is a client-rendered webapp, and i
 2. Press the browser back button
 3. Repeat to see if the scenario is leaking
 
-For other scenarios, see [scenarios](#scenarios).
+For other scenarios, see [scenarios](#scenario).
 
 # How it works
 
@@ -53,6 +53,7 @@ Options:
   -H, --heapsnapshot         Save heapsnapshot files
   -d, --debug                Run in debug mode
   -p, --progress             Show progress spinner (use --no-progress to disable)
+  -b, --browser-arg <arg>    Arg(s) to pass when launching the browser
   -V, --version              output the version number
   -h, --help                 display help for command
 ```
@@ -67,7 +68,7 @@ The URL to load. This should be whatever landing page you want to start at. Note
 
     -o, --output <file>
 
-`fuite` generates a lot of data, but not all of it is shown in the CLI output. To dig deeper, use the `--output` option to create a JSON file containing `fuite`'s anlaysis. This contains additional information such as the line of code that an event listener was declared on.
+`fuite` generates a lot of data, but not all of it is shown in the CLI output. To dig deeper, use the `--output` option to create a JSON file containing `fuite`'s analysis. This contains additional information such as the line of code that an event listener was declared on.
 
 Anything that you see in the CLI, you can also find in the output JSON file.
 
@@ -89,34 +90,65 @@ The default scenario is to find all internal links on the page, click them, and 
 fuite --scenario ./myScenario.mjs https://example.com
 ```
 
+Your `myScenario.mjs` can export several `async function`s, most of which are optional.
+
+Here is a template:
+
 ```js
 // myScenario.mjs
+
+/**
+ * OPTIONAL: Setup code to run before each test
+ * @param { import("puppeteer").Page } page
+*/
 export async function setup(page) {
-  // Setup code to run before each test
 }
 
+/**
+ * OPTIONAL: Code to run once on the page to determine which tests to run
+ * @param { import("puppeteer").Page } page
+ */
 export async function createTests(page) {
-  // Code to run once on the page to determine which tests to run
 }
 
+/**
+ * REQUIRED: Run a single iteration against a page – e.g., click a link and then go back
+ * @param { import("puppeteer").Page } page
+ * @param { any } data
+ */
 export async function iteration(page, data) {
-  // Run a single iteration against a page – e.g., click a link and then go back
+}
+
+/**
+ * OPTIONAL: Teardown code to run after each test
+ * @param { import("puppeteer").Page } page
+ */
+export async function teardown(page) {
+}
+
+/**
+ * OPTIONAL: Code to wait asynchronously for the page to become idle
+ * @param { import("puppeteer").Page } page
+ */
+export async function waitForIdle(page) {
 }
 ```
 
-Your `myScenario.mjs` can export several `async function`s. Here's what they do:
+You can delete any optional functions you don't need.
 
-### `setup` function
+Note that your scenario file can also [extend the default scenario](#extending-the-default-scenario).
 
-The `setup` function takes a Puppeteer [Page][] as input and returns undefined. It runs before each `iteration`, or before `createTests`. This is a good place to log in, if your webapp requires a login.
+### `setup` function (optional)
+
+The async `setup` function takes a Puppeteer [Page][] as input and returns undefined. It runs before each `iteration`, or before `createTests`. This is a good place to log in, if your webapp requires a login.
 
 If this function is not defined, then no setup code will be run.
 
 Note that there is also a [`--setup` flag](#setup). If defined, it will override the `setup` function defined in a scenario.
 
-### `createTests` function
+### `createTests` function (optional)
 
-The `createTests` function takes a Puppeteer [Page][] as input and returns an array of _test data objects_ representing the tests to run, and the data to pass for each one. This is useful if you want to dynamically determine what tests to run against a page (for instance, which links to click).
+The async `createTests` function takes a Puppeteer [Page][] as input and returns an array of _test data objects_ representing the tests to run, and the data to pass for each one. This is useful if you want to dynamically determine what tests to run against a page (for instance, which links to click).
 
 If `createTests` is not defined, then the default tests are `[{}]` (a single test with empty data).
 
@@ -146,9 +178,9 @@ For instance, your `createTests` might return:
 ]
 ```
 
-### `iteration` function
+### `iteration` function (required)
 
-The `iteration` function takes a Puppeteer [Page][] and _iteration data_ as input and returns undefined. It runs for each iteration of the memory leak test. The _iteration data_ is a plain object and comes from the `createTests` function, so by default it is just an empty object: `{}`.
+The async `iteration` function takes a Puppeteer [Page][] and _iteration data_ as input and returns undefined. It runs for each iteration of the memory leak test. The _iteration data_ is a plain object and comes from the `createTests` function, so by default it is just an empty object: `{}`.
 
 Inside of an `iteration`, you want to run the core test logic that you want to test for leaks. The idea is that, at the beginning of the iteration and at the end, the memory _should_ be the same.  So an iteration might do things like:
 
@@ -158,6 +190,27 @@ Inside of an `iteration`, you want to run the core test logic that you want to t
 - Etc.
 
 The iteration assumes that whatever page it starts at, it ends up at that same page. If you test a multi-page app in this way, then it's extremely unlikely you'll detect any leaks, since multi-page apps don't leak memory in the same way that SPAs do when navigating between routes.
+
+### `teardown` function (optional)
+
+The async `teardown` function takes a Puppeteer [Page][] as input and returns undefined. It runs after each `iteration`, or after `createTests`.
+
+If this function is not defined, then no teardown code will be run.
+
+### `waitForIdle` function (optional)
+
+The async `waitForIdle` function takes a Puppeteer [Page][] and should resolve when the page is considered "idle."
+
+Here is an example idle check:
+
+```js
+export async function waitForIdle(page) {
+  await new Promise(resolve => setTimeout(resolve, 2000)) // wait 2 seconds
+  await page.waitForSelector('#my-element') // wait for element
+}
+```
+
+If this function is not defined, then the default idle check is used. The default is based on heuristics, using the network idle and main thread idle.
 
 ## Setup
 
@@ -181,7 +234,7 @@ Then pass it in:
 npx fuite https://example.com --setup ./mySetup.mjs
 ```
 
-The [`setup` function](#setup-function) defined here is the same one that you can define in a custom scenario using [`--scenario`](#scenario) (i.e. it takes a Puppeteer [Page][] as input).
+The [`setup` function](#setup-function-optional) defined here is the same one that you can define in a custom scenario using [`--scenario`](#scenario) (i.e. it takes a Puppeteer [Page][] as input).
 
 If both `--scenario` and `--setup` are defined, then `--setup` will override the `setup` function in the scenario.
 
@@ -213,6 +266,19 @@ This will launch Chrome in non-headless mode, and it will also automatically pau
 
 Enable or disable the progress spinner while the test runs. It's true by default, so you should use `--no-progress` to disable.
 
+## Browser args
+
+    -b, --browser-arg <arg>   Arg(s) to pass when launching the browser
+
+This allows you to pass args (aka flags) into Puppeteer when launching the browser. You can define multiple args,
+and they are passed ver batim to [Puppeteer's launch `args` option](https://pptr.dev/#?product=Puppeteer&version=v13.0.1&show=api-puppeteerlaunchoptions).
+
+For example:
+
+```shell
+fuite <url> -b --use-fake-device-for-media-stream -b --enable-experimental-web-platform-features
+```
+
 # JavaScript API
 
 `fuite` can also be used via a JavaScript API, which works similarly to the CLI:
@@ -225,7 +291,8 @@ const results = findLeaks('https://example.com', {
   iterations: 7,
   heapsnapshot: false,
   debug: false,
-  progress: true
+  progress: true,
+  browserArgs: ['--use-fake-device-for-media-stream']
 });
 for await (const result of results) {
   console.log(result);
@@ -265,7 +332,8 @@ For the JavaScript API, you can pass in a custom scenario as a plain object. Fir
 const myScenario = {
   async setup(page) { /* ... */ },
   async createTests(page) { /* ... */ },
-  async iteration(page, data) { /* ... */ }
+  async iteration(page, data) { /* ... */ },
+  async teardown(page) { /* ... */ }
 };
 ```
 
@@ -314,7 +382,7 @@ Note that the above works if you're using the JavaScript API. For the CLI, you p
 
 Similarly, `fuite` measures the JavaScript heap size of the page, corresponding to what you see in the Chrome DevTool's Memory tab. It ignores the size of native browser objects.
 
-`fuite` works best when your source code is unminified. Otherwise the class names will show as the minified versions, which can be hard to debug.
+`fuite` works best when your source code is unminified. Otherwise, the class names will show as the minified versions, which can be hard to debug.
 
 `fuite` may use a lot of memory itself to analyze large heap snapshot files. If you find that Node.js is running out of memory, you can run something like:
 
@@ -349,37 +417,27 @@ Use the `--output` command to output a JSON file, which will contain a list of e
 
 **How do I debug leaking collections?**
 
-Figuring out why an Array or Object is continually growing may be tricky. First, run `fuite` in debug mode:
+`fuite` will analyze your leaking collections and print out a stacktrace of which code caused the increase –
+for instance, `push`ing to an Array, or `set`ing a Map. So this is the first place to look.
+
+If you have sourcemaps, it will show the original source. Otherwise, it'll show the raw stacktrace.
+
+Sometimes more than one thing is increasing the size, and not every increase is at fault (e.g. it deletes right after).
+In those cases, you should use `--output` and look at the JSON output to see the full list of stacktraces.
+
+In some other cases, `fuite` is not able to track increases in collections. (E.g. the object disallows modifications, or the code uses `Array.prototype.push.call()` instead of `.push()`ing directly.)
+
+In those cases, you may have to do a manual analysis. Below is how you can do that.
+
+First, run `fuite` in debug mode:
 
     NODE_OPTIONS=--inspect-brk fuite https://example.com --debug
 
-Then open `chrome:inspect` in Chrome and click "Open dedicated DevTools for Node." Then, when the breakpoint is hit, open the DevTools in Chrome and click the "Play" button to let the scenario keep running.
+Then open `chrome:inspect` in Chrome and click "Open dedicated DevTools for Node." Then, when the breakpoint is hit, open the DevTools in Chromium (the one running your website) and click the "Play" button to let the scenario keep running.
 
 Eventually `fuite` will give you a breakpoint in the Chrome DevTools itself, where you have access to the leaking collection (Array, Map, etc.) and can inspect it.
 
-One technique is to override the object's methods to check whenever it's called:
-
-```js
-for (const prop of ['push', 'concat', 'unshift', 'splice']) {
-  const original = obj[prop]; // `obj` is the array
-  obj[prop] = function () {
-    debugger;
-    return original.apply(this, arguments);
-  };
-}
-```
-
-For Maps you can override `set`, and for Sets you can override `add`. For plain Objects, you'll need a slightly more elaborate solution:
-
-```js
-// `obj` is the plain object
-Object.setPrototypeOf(obj, new Proxy(Object.create(null), {
-  set (obj, prop, val) {
-    debugger;
-    return (obj[prop] = val);
-  }
-}))
-```
+It will also give you `debugger` breakpoints on when the collection is increasing (e.g. `push`, `set`, etc.). For plain objects, it tries to override the prototype and spy on setters to accomplish this.
 
 Note that not every leaking collection is a serious memory leak: for instance, your router may keep some metadata about past routes in an ever-growing stack. Or your analytics library may store some timings in an array that continually grows. These are generally not a concern unless the objects are huge, or contain closures that reference lots of memory.
 

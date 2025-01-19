@@ -1,29 +1,48 @@
 import puppeteer from 'puppeteer'
 import * as defaultScenario from './defaultScenario.js'
-import { takeHeapSnapshot } from './heapsnapshots.js'
-import { waitForPageIdle } from './puppeteerUtil.js'
-import { getDomNodesAndListeners } from './eventListeners.js'
-import fs from 'fs/promises'
-import { analyzeHeapSnapshots } from './analyzeHeapsnapshots.js'
-import { analyzeEventListeners, calculateEventListenersSummary } from './analyzeEventListeners.js'
-import { findLeakingCollections, startTrackingCollections } from './collections.js'
+import { defaultWaitForPageIdle } from './puppeteerUtil.js'
 import ora from 'ora'
-import { analyzeDomNodes } from './analyzeDomNodes.js'
+import { serial } from './util.js'
+import { collectionsMetric } from './metrics/collections/index.js'
+import { domNodesAndListenersMetric } from './metrics/domNodesAndListeners/index.js'
+import { heapsnapshotsMetric } from './metrics/heapsnapshots/index.js'
+import { setCustomWaitForPageIdle } from './customWaitForPageIdle.js'
+
+// Maximum 32-bit signed integer, for sending CDP a high enough timeout
+const MAX_SIGNED_INT32 = Math.pow(2, 31) - 1
+
+// it's important that heapsnapshotsMetric is the last one here, because we want to run it after all the other metrics
+// (in the "before" step) and before all the other ones (in the "after" step) to avoid capturing unnecessary
+// stuff in the heapsnapshot
+const metricFactories = [
+  collectionsMetric,
+  domNodesAndListenersMetric,
+  heapsnapshotsMetric
+]
 
 export const DEFAULT_ITERATIONS = 7
 
-async function runOnFreshPage (browser, pageUrl, setup, runnable) {
+async function runOnFreshPage (browser, pageUrl, setup, teardown, waitForIdle, runnable) {
   const page = await browser.newPage()
+
+  const doWaitForIdle = waitForIdle || defaultWaitForPageIdle
 
   try {
     await page.goto(pageUrl)
-    await waitForPageIdle(page)
+    await doWaitForIdle(page)
 
     if (setup) {
       await setup(page)
-      await waitForPageIdle(page)
+      await doWaitForIdle(page)
     }
-    return (await runnable(page))
+    try {
+      return await runnable(page)
+    } finally {
+      if (teardown) {
+        await doWaitForIdle(page)
+        await teardown(page)
+      }
+    }
   } finally {
     await page.close()
   }
@@ -31,9 +50,12 @@ async function runOnFreshPage (browser, pageUrl, setup, runnable) {
 
 async function analyzeOptions (options) {
   const { debug, heapsnapshot, progress } = options
+  const args = Array.isArray(options.browserArgs) ? options.browserArgs : []
   const browser = await puppeteer.launch({
     headless: !debug,
-    defaultViewport: { width: 1280, height: 800 }
+    defaultViewport: { width: 1280, height: 800 },
+    args,
+    ...(debug && { protocolTimeout: MAX_SIGNED_INT32 }) // avoid timeouts when you're trying to debug
   })
   if (options.signal) {
     options.signal.addEventListener('abort', () => {
@@ -90,24 +112,51 @@ async function runWithCdpSession (page, runnable) {
   }
 }
 
+function mergeResults (results, numIterations) {
+  const result = {
+    leaks: Object.assign({}, ...results.map(_ => _.leaks)),
+    before: Object.assign({}, ...results.map(_ => _.before)),
+    after: Object.assign({}, ...results.map(_ => _.after))
+  }
+
+  // This data comes from the heap snapshot metric. The current heuristic is to only
+  // report "leaks detected" if the deltaPerIteration is >0 and any metric reported something
+  // detected. This is to avoid saying "leaks detected" when the deltaPerIteration is below
+  // zero, which would probably be confusing.
+  const delta = result.after.statistics.total - result.before.statistics.total
+  const deltaPerIteration = Math.round(delta / numIterations)
+  const leaksDetected = deltaPerIteration > 0 && results.some(_ => _.leaksDetected)
+
+  result.delta = delta
+  result.deltaPerIteration = deltaPerIteration
+  result.leaks.detected = leaksDetected
+  result.numIterations = numIterations
+
+  return result
+}
+
 export async function * findLeaks (pageUrl, options = {}) {
   const {
     scenario, numIterations, progress, debug, heapsnapshot, browser
   } = await analyzeOptions(options)
-  const { setup, createTests, iteration } = scenario
+  const { setup, createTests, iteration, teardown, waitForIdle } = scenario
 
   pageUrl = massagePageUrl(pageUrl)
 
   const runIterationOnPage = async (onProgress, test) => {
-    return (await runOnFreshPage(browser, pageUrl, setup, async page => {
+    return (await runOnFreshPage(browser, pageUrl, setup, teardown, waitForIdle, async page => {
       await iteration(page, test.data) // one throwaway iteration to avoid measuring one-time setup costs
-      onProgress('Taking start snapshot...')
       return (await runWithCdpSession(page, async cdpSession => {
-        const weakMap = await startTrackingCollections(page)
-        const { nodes: domNodesStart, listeners: eventListenersStart } = await getDomNodesAndListeners(page, cdpSession)
-        const startSnapshotFilename = await takeHeapSnapshot(page, cdpSession)
+        const metrics = metricFactories.map(_ => _({ page, cdpSession, heapsnapshot, debug, numIterations }))
+
+        onProgress('Taking start snapshot...')
+        for (const metric of metrics) {
+          await metric.beforeIterations()
+        }
         if (debug) {
-          // Point in time before running any iterations
+          // Point in time after the first throwaway iteration but before the main loop of iterations.
+          // If you're paused here, this is a good time to open the *browser* DevTools and take a manual heap snapshot.
+          // (Memory -> heap snapshot -> take snapshot)
           debugger // eslint-disable-line no-debugger
         }
         for (let i = 0; i < numIterations; i++) {
@@ -115,73 +164,37 @@ export async function * findLeaks (pageUrl, options = {}) {
           await iteration(page, test.data)
         }
         onProgress('Taking end snapshot...')
-        const endSnapshotFilename = await takeHeapSnapshot(page, cdpSession)
-        const { nodes: domNodesEnd, listeners: eventListenersEnd } = await getDomNodesAndListeners(page, cdpSession)
-        const leakingCollections = await findLeakingCollections(page, weakMap, numIterations, debug)
+        for (const metric of [...metrics].reverse()) { // run in reverse order to ensure heap snapshot happens first
+          await metric.afterIterations()
+        }
         if (debug) {
-          // Point in time after running iterations
+          // Point in time after running the main loop of iterations.
+          // If you're paused here, this is a good time to open the *browser* DevTools, so you can:
+          //   1. take a second heap snapshot to compare with the first, and/or
+          //   2. wait for more debugger statements if you're trying to debug leaking collections.
           debugger // eslint-disable-line no-debugger
         }
 
-        onProgress('Analyzing snapshots...')
-        const { leakingObjects, startStatistics, endStatistics } = await analyzeHeapSnapshots(
-          startSnapshotFilename, endSnapshotFilename, numIterations
-        )
-        const leakingListeners = analyzeEventListeners(eventListenersStart, eventListenersEnd, numIterations)
-        const eventListenersSummary = calculateEventListenersSummary(eventListenersStart, eventListenersEnd, numIterations)
-        const leakingDomNodes = analyzeDomNodes(domNodesStart, domNodesEnd, numIterations)
-        const domNodesSummary = {
-          delta: domNodesEnd.length - domNodesStart.length,
-          deltaPerIteration: (domNodesEnd.length - domNodesStart.length) / numIterations,
-          nodes: leakingDomNodes
-        }
-        const delta = endStatistics.total - startStatistics.total
-        const deltaPerIteration = Math.round(delta / numIterations)
-        const leaksDetected = Boolean(
-          deltaPerIteration > 0 && (
-            leakingObjects.length ||
-            (eventListenersSummary.delta > 0) ||
-            (domNodesSummary.delta > 0) ||
-            leakingCollections.length
-          )
-        )
-
-        const result = {
-          delta,
-          deltaPerIteration,
-          numIterations,
-          leaks: {
-            detected: leaksDetected,
-            objects: leakingObjects,
-            eventListeners: leakingListeners,
-            eventListenersSummary, // eventListenersSummary is a separate object for backwards compat
-            domNodes: domNodesSummary,
-            collections: leakingCollections
-          },
-          before: {
-            statistics: startStatistics,
-            eventListeners: eventListenersStart,
-            domNodes: {
-              count: domNodesStart.length, // domNodes.count is redundant, but for backwards compat
-              nodes: domNodesStart
-            }
-          },
-          after: {
-            statistics: endStatistics,
-            eventListeners: eventListenersEnd,
-            domNodes: {
-              count: domNodesEnd.length, // domNodes.count is redundant, but for backwards compat
-              nodes: domNodesEnd
+        try {
+          if (metrics.some(metric => metric.needsExtraIteration?.())) {
+            onProgress('Extra iteration for analysis...')
+            await iteration(page, test.data)
+            for (const metric of metrics) {
+              await (metric.afterExtraIteration?.())
             }
           }
+        } catch (err) {
+          // ignore if the extra iteration doesn't work for any reason; it's optional
+          // TODO: error log
         }
 
-        if (heapsnapshot) {
-          result.before.heapsnapshot = startSnapshotFilename
-          result.after.heapsnapshot = endSnapshotFilename
-        } else {
-          await Promise.all([fs.rm(startSnapshotFilename), fs.rm(endSnapshotFilename)])
-        }
+        onProgress('Analyzing snapshots...')
+        // Run in serial just in case something consumes a lot of memory (e.g. heap snapshot analysis)
+        const results = await serial(metrics.map(metric => () => metric.getResult()))
+        const result = mergeResults(results, numIterations)
+
+        // Assume cleanup code can run in parallel
+        await Promise.all(metrics.map(metric => metric.cleanup?.()))
 
         return { test, result }
       }))
@@ -206,24 +219,25 @@ export async function * findLeaks (pageUrl, options = {}) {
     }
   }
 
+  const doCreateTests = async () => {
+    return (await runWithSpinner(progress, async onProgress => {
+      onProgress('Gathering tests...')
+      return (await runOnFreshPage(browser, pageUrl, setup, teardown, waitForIdle, page => createTests(page)))
+    }))
+  }
+
   try {
-    let tests
-    if (createTests) {
-      tests = await runWithSpinner(progress, async onProgress => {
-        onProgress('Gathering tests...')
-        return (await runOnFreshPage(browser, pageUrl, setup, async page => {
-          return createTests(page)
-        }))
-      })
-    } else {
-      tests = [{}] // default - one test with empty data
-    }
+    setCustomWaitForPageIdle(waitForIdle) // communicate with defaultScenario.js about how to check for idle
+    const tests = createTests
+      ? (await doCreateTests())
+      : [{}] // default - one test with empty data
     for (let i = 0; i < tests.length; i++) {
       const test = tests[i]
       const result = (await runIteration(test, i, tests.length))
       yield result
     }
   } finally {
+    setCustomWaitForPageIdle(undefined) // revert to default
     await browser.close()
   }
 }

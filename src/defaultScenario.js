@@ -1,5 +1,6 @@
-import { waitForPageIdle } from './puppeteerUtil.js'
+import { defaultWaitForPageIdle } from './puppeteerUtil.js'
 import { ono } from 'ono'
+import { getCustomWaitForPageIdle } from './customWaitForPageIdle.js'
 
 function urlsAreEqual (url1, url2) {
   for (const prop of ['protocol', 'hostname', 'port', 'pathname', 'search']) {
@@ -24,6 +25,7 @@ async function clickFirstVisible (page, selector) {
       return el.target === '' &&
         // quick and dirty visibility check
         window.getComputedStyle(el).getPropertyValue('display') !== 'none' &&
+        window.getComputedStyle(el).getPropertyValue('visibility') !== 'hidden' &&
         el.offsetHeight > 0 &&
         el.offsetWidth > 0
     })[0]
@@ -49,6 +51,7 @@ export async function createTests (page) {
         return el.target === '' &&
           // quick and dirty visibility check
           window.getComputedStyle(el).getPropertyValue('display') !== 'none' &&
+          window.getComputedStyle(el).getPropertyValue('visibility') !== 'hidden' &&
           el.offsetHeight > 0 &&
           el.offsetWidth > 0
       })
@@ -74,7 +77,7 @@ export async function createTests (page) {
     return {
       data: {
         href: originalHref,
-        fullHref: fullHref
+        fullHref
       },
       description: `Go to ${url.pathname + url.search + url.hash} and back`
     }
@@ -82,8 +85,10 @@ export async function createTests (page) {
 }
 
 export async function iteration (page, { href }) {
+  const doWaitForIdle = getCustomWaitForPageIdle() || defaultWaitForPageIdle
+
   await clickFirstVisible(page, `a[href=${JSON.stringify(href)}]`)
-  await waitForPageIdle(page)
+  await doWaitForIdle(page)
   await page.goBack()
-  await waitForPageIdle(page)
+  await doWaitForIdle(page)
 }
